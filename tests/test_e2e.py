@@ -140,6 +140,137 @@ def test_end_to_end_over_http(server):
         assert affected["S3"]["path"][-1]["version"] == 2
 
 
+def test_end_to_end_inventory_check_over_http(server):
+    with httpx.Client(base_url=server, timeout=10) as http:
+        intake = http.post(
+            "/intakes",
+            json={
+                "samples": [
+                    {"sample_id": "S1", "batch_nos": ["B1", "B2"]},
+                    {"sample_id": "S2", "batch_nos": ["B2", "B3"]},
+                    {"sample_id": "S3", "batch_nos": ["B4", "B5"]},
+                ],
+                "batches": [
+                    {
+                        "batch_no": "B1",
+                        "origin": "collection-lab",
+                        "destination": "hub-north",
+                        "departed_at": "2026-01-01T08:00:00Z",
+                        "arrived_at": "2026-01-01T10:00:00Z",
+                    },
+                    {
+                        "batch_no": "B2",
+                        "origin": "hub-north",
+                        "destination": "reference-lab",
+                        "departed_at": "2026-01-01T20:00:00Z",
+                        "arrived_at": "2026-01-01T22:00:00Z",
+                    },
+                    {
+                        "batch_no": "B3",
+                        "origin": "reference-lab",
+                        "destination": "archive",
+                        "departed_at": "2026-01-02T08:00:00Z",
+                        "arrived_at": "2026-01-02T10:00:00Z",
+                    },
+                    # Overlapping transfers for S3: a conflict, never in stock.
+                    {
+                        "batch_no": "B4",
+                        "origin": "other-lab",
+                        "destination": "hub-south",
+                        "departed_at": "2026-01-01T08:00:00Z",
+                        "arrived_at": "2026-01-01T12:00:00Z",
+                    },
+                    {
+                        "batch_no": "B5",
+                        "origin": "hub-south",
+                        "destination": "archive",
+                        "departed_at": "2026-01-01T11:00:00Z",
+                        "arrived_at": "2026-01-01T13:00:00Z",
+                    },
+                ],
+            },
+        )
+        assert intake.status_code == 201, intake.text
+
+        hub = http.post(
+            "/inventory-checks",
+            json={"site": "hub-north", "as_of": "2026-01-01T15:00:00Z"},
+        )
+        assert hub.status_code == 201, hub.text
+        body = hub.json()
+        assert [s["sample_id"] for s in body["in_stock_samples"]] == ["S1"]
+        assert body["in_stock_samples"][0]["in_stock_until"] == "2026-01-01T20:00:00Z"
+        # Conflicts are reported dataset-wide, not only for the requested site.
+        assert [c["sample_id"] for c in body["conflicting_samples"]] == ["S3"]
+        query_id = body["query_id"]
+
+        archive = http.post(
+            "/inventory-checks",
+            json={"site": "archive", "as_of": "2026-01-02T11:00:00Z"},
+        ).json()
+        assert [s["sample_id"] for s in archive["in_stock_samples"]] == ["S2"]
+        assert [
+            c["sample_id"] for c in archive["conflicting_samples"]
+        ] == ["S3"]
+        assert (
+            archive["conflicting_samples"][0]["conflicts"][0]["code"]
+            == "overlapping_transits"
+        )
+
+        reread = http.get(f"/inventory-checks/{query_id}")
+        assert reread.status_code == 200
+        assert reread.json()["in_stock_samples"] == body["in_stock_samples"]
+
+        # A new association invalidates the old conclusion.
+        added = http.post(
+            "/intakes",
+            json={"samples": [{"sample_id": "S4", "batch_nos": ["B1"]}]},
+        )
+        assert added.status_code == 201
+        stale = http.get(f"/inventory-checks/{query_id}")
+        assert stale.status_code == 409
+        assert stale.json()["code"] == "snapshot_invalidated"
+        assert stale.json()["details"]["invalidations"][0]["sample_id"] == "S4"
+
+        fresh = http.post(
+            "/inventory-checks",
+            json={"site": "hub-north", "as_of": "2026-01-01T15:00:00Z"},
+        ).json()
+        assert {s["sample_id"] for s in fresh["in_stock_samples"]} == {"S1", "S4"}
+
+        # A correction invalidates too, and the fresh answer uses the new version.
+        fixed = http.post(
+            "/batches/B2/corrections",
+            json={
+                "seen_version": 1,
+                "origin": "hub-north",
+                "destination": "reference-lab",
+                "departed_at": "2026-01-01T19:00:00Z",
+                "arrived_at": "2026-01-01T22:00:00Z",
+            },
+        )
+        assert fixed.status_code == 200, fixed.text
+        assert fresh["query_id"] in fixed.json()["invalidated_inventory_query_ids"]
+        assert http.get(f"/inventory-checks/{fresh['query_id']}").status_code == 409
+
+        latest = http.post(
+            "/inventory-checks",
+            json={"site": "hub-north", "as_of": "2026-01-01T15:00:00Z"},
+        ).json()
+        assert latest["snapshot"]["batch_versions"]["B2"] == 2
+        s1 = next(
+            s for s in latest["in_stock_samples"] if s["sample_id"] == "S1"
+        )
+        assert s1["in_stock_until"] == "2026-01-01T19:00:00Z"
+
+        listing = http.get("/inventory-checks").json()["queries"]
+        assert any(row["query_id"] == query_id and row["invalidated"] for row in listing)
+        records = http.get(
+            f"/inventory-checks/{query_id}/invalidations"
+        ).json()
+        assert records[0]["kind"] == "association"
+
+
 def test_end_to_end_errors_are_structured(server):
     with httpx.Client(base_url=server, timeout=10) as http:
         assert http.post("/traces", json={}).status_code == 404

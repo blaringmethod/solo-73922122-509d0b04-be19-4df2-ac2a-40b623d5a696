@@ -416,6 +416,10 @@ class CorrectionResponse(BaseModel):
     departed_at: datetime
     arrived_at: datetime
     invalidated_trace_ids: list[int]
+    invalidated_inventory_query_ids: list[int] = Field(
+        default_factory=list,
+        description="Inventory checks invalidated by this correction.",
+    )
 
 
 class DatasetResponse(BaseModel):
@@ -430,3 +434,136 @@ class ErrorBody(BaseModel):
     code: str
     message: str
     details: dict[str, Any] | None = None
+
+
+# ------------------------------------------------------- as-of inventory ----
+
+
+class InventoryRequest(BaseModel):
+    """Which station to check, and at which UTC instant."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "example": {
+                "site": "Reference-Lab",
+                "as_of": "2026-01-02T11:00:00Z",
+            }
+        },
+    )
+
+    site: str = Field(
+        max_length=256,
+        description="Station name, matched exactly against batch origins/destinations.",
+    )
+    as_of: datetime = Field(
+        description=(
+            "UTC instant to reconstruct. Offsets are normalised to UTC; a naive"
+            " value is interpreted as UTC."
+        )
+    )
+
+    _normalise_site = field_validator("site")(
+        lambda v, info: _clean(v, info.field_name)
+    )
+
+    @field_validator("as_of")
+    @classmethod
+    def _aware(cls, v: datetime, info) -> datetime:
+        return _to_utc(v, info.field_name)
+
+
+class InventoryBatchRef(BaseModel):
+    """A batch at the version pinned by an inventory query."""
+
+    batch_no: str
+    version: int
+    origin: str
+    destination: str
+    departed_at: datetime
+    arrived_at: datetime
+
+
+class SupportingBatch(InventoryBatchRef):
+    role: str = Field(
+        description=(
+            "'arrival' is the batch that brought the sample into storage;"
+            " 'next_departure' is the batch that will take it out again."
+        )
+    )
+
+
+class BatchConflict(BaseModel):
+    code: str = Field(
+        description=(
+            "'overlapping_transits' (the later transfer departs before the"
+            " earlier one arrives) or 'disconnected_route' (consecutive"
+            " transfers do not share a station)."
+        )
+    )
+    message: str
+    batch_nos: list[str]
+    batches: list[InventoryBatchRef]
+
+
+class InStockSample(BaseModel):
+    sample_id: str
+    in_stock_since: datetime = Field(
+        description="Arrival at this site that started the current storage stay."
+    )
+    in_stock_until: datetime | None = Field(
+        description=(
+            "Departure of the next transfer, or null when no further transfer"
+            " is recorded and the sample remains here."
+        )
+    )
+    supporting_batches: list[SupportingBatch]
+
+
+class ConflictingSample(BaseModel):
+    sample_id: str
+    conflicts: list[BatchConflict]
+
+
+class InventorySnapshotInfo(BaseModel):
+    intake_id: int
+    accepted_at: datetime
+    associations: dict[str, list[str]] = Field(
+        description="Pinned sample -> batch associations used by this query."
+    )
+    batch_versions: dict[str, int] = Field(
+        description="Versions of every batch referenced by the pinned associations."
+    )
+    batches: list[InventoryBatchRef] = Field(
+        default_factory=list,
+        description="The exact batch records used to compute this query.",
+    )
+
+
+class InventoryResponse(BaseModel):
+    query_id: int
+    site: str
+    as_of: datetime
+    status: str
+    in_stock_samples: list[InStockSample]
+    conflicting_samples: list[ConflictingSample]
+    in_stock_count: int
+    conflict_count: int
+    snapshot: InventorySnapshotInfo
+    error: str | None = None
+
+
+class InventorySummary(BaseModel):
+    query_id: int
+    site: str
+    as_of: datetime
+    status: str
+    accepted_at: datetime
+    completed_at: datetime | None = None
+    in_stock_count: int
+    conflict_count: int
+    invalidated: bool
+
+
+class InventoryListResponse(BaseModel):
+    queries: list[InventorySummary]

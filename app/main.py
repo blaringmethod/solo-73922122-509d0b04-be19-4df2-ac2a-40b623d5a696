@@ -9,6 +9,9 @@ Endpoints
 ``POST /traces``                   run a trace on a pinned snapshot
 ``GET  /traces``                    list accepted traces
 ``GET  /traces/{id}``               re-read a published snapshot result
+``POST /inventory-checks``          as-of on-site inventory on a pinned snapshot
+``GET  /inventory-checks``          list accepted inventory checks
+``GET  /inventory-checks/{id}``     re-read a published inventory check
 ``GET  /healthz``                   readiness probe
 """
 from __future__ import annotations
@@ -22,19 +25,29 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from . import tracing
+from . import inventory, tracing
 from .schemas import (
     AffectedSample,
+    BatchConflict,
     BatchCorrection,
     BatchOut,
+    ConflictingSample,
     CorrectionResponse,
     DatasetResponse,
     ErrorBody,
+    InStockSample,
     IntakeRequest,
     IntakeResponse,
     InvalidationInfo,
+    InventoryBatchRef,
+    InventoryListResponse,
+    InventoryRequest,
+    InventoryResponse,
+    InventorySnapshotInfo,
+    InventorySummary,
     PathLeg,
     SnapshotInfo,
+    SupportingBatch,
     TraceListResponse,
     TraceRequest,
     TraceResponse,
@@ -76,13 +89,21 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "* Corrections are versioned (`seen_version` optimistic lock),"
             " replace the old record and invalidate snapshots pinned to it.\n"
             "* `POST /traces` pins a snapshot at acceptance time and publishes"
-            " results only when complete; failed traces expose no partial rows."
+            " results only when complete; failed traces expose no partial rows.\n"
+            "* `POST /inventory-checks` reconstructs which samples are stored at"
+            " a station at a given UTC instant, reports conflicting batch"
+            " sequences separately, and invalidates old conclusions when the"
+            " pinned associations or batch versions change."
         ),
         lifespan=lifespan,
         openapi_tags=[
             {"name": "intake", "description": "Register samples and batches."},
             {"name": "corrections", "description": "Versioned batch replacement."},
             {"name": "traces", "description": "Contamination trace snapshots."},
+            {
+                "name": "inventory",
+                "description": "As-of on-site inventory checks.",
+            },
         ],
     )
     app.state.store = store
@@ -152,6 +173,62 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 batches=[BatchOut(**row) for row in bundle["batches"]],
             ),
             error=trace["error"],
+        )
+
+    def _inventory_response(bundle: Any) -> InventoryResponse:
+        query = bundle["query"]
+        invalidated = bool(bundle["invalidations"])
+        in_stock: list[InStockSample] = []
+        conflicts: list[ConflictingSample] = []
+        if query["status"] == "complete" and not invalidated:
+            for row in bundle["results"]:
+                if row["kind"] == "in_stock":
+                    in_stock.append(
+                        InStockSample(
+                            sample_id=row["sample_id"],
+                            in_stock_since=parse_iso(row["in_stock_since"]),
+                            in_stock_until=(
+                                parse_iso(row["in_stock_until"])
+                                if row["in_stock_until"]
+                                else None
+                            ),
+                            supporting_batches=[
+                                SupportingBatch(**leg)
+                                for leg in _load_json(row["support_json"])
+                            ],
+                        )
+                    )
+                else:
+                    conflicts.append(
+                        ConflictingSample(
+                            sample_id=row["sample_id"],
+                            conflicts=[
+                                BatchConflict(**conflict)
+                                for conflict in _load_json(row["conflicts_json"])
+                            ],
+                        )
+                    )
+        return InventoryResponse(
+            query_id=int(query["id"]),
+            site=query["site"],
+            as_of=parse_iso(query["as_of"]),
+            status=query["status"],
+            in_stock_samples=in_stock,
+            conflicting_samples=conflicts,
+            in_stock_count=len(in_stock),
+            conflict_count=len(conflicts),
+            snapshot=InventorySnapshotInfo(
+                intake_id=int(query["intake_id"]),
+                accepted_at=parse_iso(query["accepted_at"]),
+                associations=bundle["associations"],
+                batch_versions={
+                    k: int(v) for k, v in bundle["pinned"].items()
+                },
+                batches=[
+                    InventoryBatchRef(**row) for row in bundle["batches"]
+                ],
+            ),
+            error=query["error"],
         )
 
     # ----------------------------------------------------------------- routes
@@ -405,6 +482,198 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 reason=row["reason"],
             )
             for row in store.invalidations(trace_id)
+        ]
+
+    # ------------------------------------------------------- as-of inventory
+
+    @app.post(
+        "/inventory-checks",
+        response_model=InventoryResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["inventory"],
+        summary="Reconstruct on-site inventory at a UTC instant",
+        responses={
+            404: {"model": ErrorBody, "description": "No dataset"},
+            409: {"model": ErrorBody, "description": "Snapshot became stale"},
+            500: {"model": ErrorBody, "description": "Check failed; nothing published"},
+        },
+    )
+    def run_inventory_check(payload: InventoryRequest) -> InventoryResponse:
+        try:
+            query_id, snapshot = store.accept_inventory(
+                site=payload.site, as_of=payload.as_of
+            )
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        try:
+            outcome = inventory.compute(
+                site=payload.site,
+                as_of=payload.as_of,
+                associations=snapshot["associations"],
+                batches=snapshot["batches"],
+            )
+            store.publish_inventory(
+                query_id,
+                outcome,
+                pinned=snapshot["pinned"],
+                associations=snapshot["associations"],
+            )
+        except ConflictError as exc:
+            store.fail_inventory(query_id, str(exc))
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "snapshot_changed",
+                    "message": str(exc),
+                    "details": {
+                        "query_id": query_id,
+                        "status": "failed",
+                    },
+                },
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - recorded, never half-published
+            store.fail_inventory(query_id, f"{type(exc).__name__}: {exc}")
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "inventory_failed",
+                    "message": f"{type(exc).__name__}: {exc}",
+                    "details": {"query_id": query_id, "status": "failed"},
+                },
+            ) from exc
+
+        stored = store.read_inventory(query_id)
+        assert stored is not None
+        store.log(
+            "inventory",
+            {
+                "query_id": query_id,
+                "site": payload.site,
+                "in_stock": len(outcome["in_stock_samples"]),
+                "conflicts": len(outcome["conflicting_samples"]),
+            },
+        )
+        return _inventory_response(stored)
+
+    @app.get(
+        "/inventory-checks",
+        response_model=InventoryListResponse,
+        tags=["inventory"],
+        summary="List accepted inventory checks",
+    )
+    def list_inventory_checks() -> InventoryListResponse:
+        rows = store.inventory_history()
+        return InventoryListResponse(
+            queries=[
+                InventorySummary(
+                    query_id=int(row["id"]),
+                    site=row["site"],
+                    as_of=parse_iso(row["as_of"]),
+                    status=row["status"],
+                    accepted_at=parse_iso(row["accepted_at"]),
+                    completed_at=parse_iso(row["completed_at"])
+                    if row["completed_at"]
+                    else None,
+                    in_stock_count=int(row["in_stock_count"]),
+                    conflict_count=int(row["conflict_count"]),
+                    invalidated=int(row["invalidation_count"]) > 0,
+                )
+                for row in rows
+            ]
+        )
+
+    @app.get(
+        "/inventory-checks/{query_id}",
+        response_model=InventoryResponse,
+        tags=["inventory"],
+        summary="Read one pinned inventory conclusion",
+        responses={
+            404: {"model": ErrorBody, "description": "Unknown check"},
+            409: {"model": ErrorBody, "description": "Snapshot invalidated or pending"},
+            500: {"model": ErrorBody, "description": "Check failed"},
+        },
+    )
+    def get_inventory_check(query_id: int) -> InventoryResponse:
+        bundle = store.read_inventory(query_id)
+        if bundle is None:
+            raise HTTPException(
+                status_code=404, detail="inventory check not found"
+            )
+        query = bundle["query"]
+        if bundle["invalidations"]:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "snapshot_invalidated",
+                    "message": (
+                        "this inventory conclusion was invalidated because its"
+                        " basis changed; run a new check"
+                    ),
+                    "details": {
+                        "query_id": query_id,
+                        "invalidations": [
+                            {
+                                "kind": row["kind"],
+                                "batch_no": row["batch_no"],
+                                "version": int(row["version"])
+                                if row["version"] is not None
+                                else None,
+                                "sample_id": row["sample_id"],
+                                "invalidated_at": parse_iso(
+                                    row["invalidated_at"]
+                                ).isoformat(),
+                                "reason": row["reason"],
+                            }
+                            for row in bundle["invalidations"]
+                        ],
+                    },
+                },
+            )
+        if query["status"] == "failed":
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "inventory_failed",
+                    "message": query["error"] or "inventory check failed",
+                    "details": {"query_id": query_id, "status": "failed"},
+                },
+            )
+        if query["status"] != "complete":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "inventory_pending",
+                    "message": "inventory check has not been published yet",
+                    "details": {"query_id": query_id, "status": query["status"]},
+                },
+            )
+        return _inventory_response(bundle)
+
+    @app.get(
+        "/inventory-checks/{query_id}/invalidations",
+        tags=["inventory"],
+        summary="Invalidation records for an inventory check",
+    )
+    def get_inventory_invalidations(query_id: int) -> list[dict[str, Any]]:
+        if store.inventory(query_id) is None:
+            raise HTTPException(
+                status_code=404, detail="inventory check not found"
+            )
+        return [
+            {
+                "kind": row["kind"],
+                "batch_no": row["batch_no"],
+                "version": int(row["version"])
+                if row["version"] is not None
+                else None,
+                "sample_id": row["sample_id"],
+                "invalidated_at": parse_iso(row["invalidated_at"]).isoformat(),
+                "reason": row["reason"],
+            }
+            for row in store.inventory_invalidations(query_id)
         ]
 
     return app

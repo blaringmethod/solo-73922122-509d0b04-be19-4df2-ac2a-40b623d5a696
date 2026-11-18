@@ -107,6 +107,48 @@ CREATE TABLE IF NOT EXISTS request_log (
     at      TEXT NOT NULL,
     payload TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS inventory_queries (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    intake_id    INTEGER NOT NULL REFERENCES intakes(id),
+    status       TEXT NOT NULL CHECK (status IN ('pending', 'complete', 'failed')),
+    site         TEXT NOT NULL,
+    as_of        TEXT NOT NULL,
+    accepted_at  TEXT NOT NULL,
+    completed_at TEXT,
+    error        TEXT,
+    assoc_json   TEXT NOT NULL,
+    pinned_json  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS inventory_results (
+    query_id       INTEGER NOT NULL
+                   REFERENCES inventory_queries(id) ON DELETE CASCADE,
+    kind           TEXT NOT NULL CHECK (kind IN ('in_stock', 'conflict')),
+    rank           INTEGER NOT NULL,
+    sample_id      TEXT NOT NULL,
+    in_stock_since TEXT,
+    in_stock_until TEXT,
+    support_json   TEXT,
+    conflicts_json TEXT,
+    PRIMARY KEY (query_id, kind, sample_id)
+);
+
+CREATE TABLE IF NOT EXISTS inventory_invalidations (
+    query_id       INTEGER NOT NULL
+                   REFERENCES inventory_queries(id) ON DELETE CASCADE,
+    seq            INTEGER NOT NULL,
+    kind           TEXT NOT NULL CHECK (kind IN ('batch', 'association')),
+    batch_no       TEXT,
+    version        INTEGER,
+    sample_id      TEXT,
+    invalidated_at TEXT NOT NULL,
+    reason         TEXT NOT NULL,
+    PRIMARY KEY (query_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS inventory_results_by_kind
+    ON inventory_results(query_id, kind, rank);
 """
 
 _SCHEMA_LOCK = threading.Lock()
@@ -237,6 +279,11 @@ class Store:
                 " error=? WHERE status='pending' AND accepted_at<?",
                 (iso(utcnow()), "interrupted before completion", cutoff),
             )
+            conn.execute(
+                "UPDATE inventory_queries SET status='failed', completed_at=?,"
+                " error=? WHERE status='pending' AND accepted_at<?",
+                (iso(utcnow()), "interrupted before completion", cutoff),
+            )
             return cur.rowcount
 
     # ----------------------------------------------------------------- intake
@@ -315,6 +362,7 @@ class Store:
                 inserted_batches += 1
 
             inserted_samples = 0
+            added_associations: list[tuple[str, str]] = []
             for sample in samples:
                 missing = [
                     batch_no
@@ -354,11 +402,15 @@ class Store:
                         (intake_id, sample["sample_id"]),
                     )
                 for batch_no in sample["batch_nos"]:
-                    conn.execute(
+                    cur = conn.execute(
                         "INSERT OR IGNORE INTO sample_batches(intake_id,"
                         " sample_id, batch_no) VALUES (?, ?, ?)",
                         (intake_id, sample["sample_id"], batch_no),
                     )
+                    if cur.rowcount:
+                        added_associations.append(
+                            (sample["sample_id"], batch_no)
+                        )
             for sample_id in source_sample_ids:
                 updated = conn.execute(
                     "UPDATE samples SET contaminated=1 WHERE intake_id=?"
@@ -370,6 +422,15 @@ class Store:
                         f"source sample {sample_id!r} not found in the dataset"
                     )
 
+            # A newly recorded association changes the basis of every inventory
+            # conclusion: even a brand-new sample may belong on the roster the
+            # old query published. Identical re-submissions add nothing and
+            # therefore invalidate nothing.
+            if added_associations:
+                self._invalidate_associations_for(
+                    conn, intake_id, added_associations, now
+                )
+
             dataset = self._dataset(conn, intake_id)
             return {
                 "intake_id": intake_id,
@@ -380,6 +441,84 @@ class Store:
                 "inserted_batches": inserted_batches,
                 "inserted_samples": inserted_samples,
             }
+
+    # ------------------------------------------------- inventory invalidation
+
+    @staticmethod
+    def _inventory_seq(conn: sqlite3.Connection, query_id: int) -> int:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS seq FROM inventory_invalidations"
+            " WHERE query_id=?",
+            (query_id,),
+        ).fetchone()
+        return int(row["seq"]) + 1
+
+    def _mark_inventory(
+        self,
+        conn: sqlite3.Connection,
+        query_id: int,
+        now: str,
+        *,
+        kind: str,
+        reason: str,
+        batch_no: str | None = None,
+        version: int | None = None,
+        sample_id: str | None = None,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO inventory_invalidations(query_id, seq, kind, batch_no,"
+            " version, sample_id, invalidated_at, reason)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                query_id,
+                self._inventory_seq(conn, query_id),
+                kind,
+                batch_no,
+                version,
+                sample_id,
+                now,
+                reason,
+            ),
+        )
+
+    def _invalidate_associations_for(
+        self,
+        conn: sqlite3.Connection,
+        intake_id: int,
+        added: list[tuple[str, str]],
+        now: str,
+    ) -> list[int]:
+        """Invalidate completed inventory queries when associations are added.
+
+        Only genuinely new ``(sample_id, batch_no)`` links reach this method;
+        an identical re-submission records nothing and therefore invalidates
+        nothing. Every completed check in the dataset is affected: the roster
+        is a list of *all* samples at a station, so even a sample that is new to
+        the dataset or rides a batch it did not ride before can change it.
+        """
+        affected = [
+            int(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM inventory_queries"
+                " WHERE intake_id=? AND status='complete' ORDER BY id",
+                (intake_id,),
+            ).fetchall()
+        ]
+        for query_id in affected:
+            for sample_id, batch_no in sorted(added):
+                self._mark_inventory(
+                    conn,
+                    query_id,
+                    now,
+                    kind="association",
+                    reason=(
+                        f"association {sample_id!r} -> batch {batch_no!r} was"
+                        " recorded after this query was accepted"
+                    ),
+                    sample_id=sample_id,
+                    batch_no=batch_no,
+                )
+        return affected
 
     # ------------------------------------------------------------------ reads
 
@@ -535,6 +674,26 @@ class Store:
                     " VALUES (?, ?, ?, ?, ?)",
                     (trace_id, batch_no, version, now, reason),
                 )
+
+            inventory_rows = conn.execute(
+                "SELECT q.id FROM inventory_queries q, json_each(q.pinned_json) e"
+                " WHERE q.intake_id=? AND q.status='complete'"
+                " AND e.key=? AND CAST(e.value AS INTEGER)=?",
+                (intake_id, batch_no, version),
+            ).fetchall()
+            invalidated_inventory = sorted(
+                int(row["id"]) for row in inventory_rows
+            )
+            for query_id in invalidated_inventory:
+                self._mark_inventory(
+                    conn,
+                    query_id,
+                    now,
+                    kind="batch",
+                    reason=reason,
+                    batch_no=batch_no,
+                    version=version,
+                )
             return {
                 "batch_no": batch_no,
                 "previous_version": version,
@@ -544,6 +703,7 @@ class Store:
                 "departed_at": departed_at,
                 "arrived_at": arrived_at,
                 "invalidated_trace_ids": invalidated,
+                "invalidated_inventory_query_ids": invalidated_inventory,
             }
 
     # ---------------------------------------------------------------- traces
@@ -815,6 +975,315 @@ class Store:
                 " (SELECT COUNT(*) FROM trace_invalidations i"
                 "   WHERE i.trace_id=t.id) AS invalidation_count"
                 " FROM traces t ORDER BY t.id DESC"
+            ).fetchall()
+
+    # -------------------------------------------------- as-of inventory API
+
+    def accept_inventory(
+        self, *, site: str, as_of: datetime
+    ) -> tuple[int, dict[str, Any]]:
+        """Pin the current associations and batch versions for one query.
+
+        The snapshot (sample associations plus referenced batch records) and
+        the ``pending`` query row are written in a single ``BEGIN IMMEDIATE``
+        transaction, so a concurrent intake or correction can never land
+        between what was read and what was pinned.
+
+        Raises:
+            NotFoundError: no active dataset.
+        """
+        with self.transaction() as conn:
+            snapshot = self._inventory_snapshot_in(conn)
+            if snapshot is None:
+                raise NotFoundError("no dataset")
+            cur = conn.execute(
+                "INSERT INTO inventory_queries(intake_id, status, site, as_of,"
+                " accepted_at, assoc_json, pinned_json)"
+                " VALUES (?, 'pending', ?, ?, ?, ?, ?)",
+                (
+                    snapshot["intake_id"],
+                    site,
+                    iso(as_of),
+                    iso(utcnow()),
+                    json.dumps(snapshot["associations"], sort_keys=True),
+                    json.dumps(snapshot["pinned"], sort_keys=True),
+                ),
+            )
+            return int(cur.lastrowid), snapshot
+
+    @staticmethod
+    def _assoc_batch_nos(associations: dict[str, list[str]]) -> set[str]:
+        """Batch numbers actually referenced by the pinned associations."""
+        return {batch_no for batch_nos in associations.values() for batch_no in batch_nos}
+
+    @staticmethod
+    def _inventory_snapshot_in(
+        conn: sqlite3.Connection,
+    ) -> dict[str, Any] | None:
+        intake = conn.execute(
+            "SELECT id FROM intakes WHERE status='active'"
+        ).fetchone()
+        if intake is None:
+            return None
+        intake_id = int(intake["id"])
+        current = {
+            row["batch_no"]: int(row["version"])
+            for row in conn.execute(
+                "SELECT batch_no, version FROM batches"
+                " WHERE intake_id=? AND superseded=0",
+                (intake_id,),
+            ).fetchall()
+        }
+        associations: dict[str, list[str]] = {}
+        for row in conn.execute(
+            "SELECT sample_id, batch_no FROM sample_batches"
+            " WHERE intake_id=? ORDER BY sample_id, batch_no",
+            (intake_id,),
+        ).fetchall():
+            associations.setdefault(row["sample_id"], []).append(row["batch_no"])
+        pinned = {
+            batch_no: version
+            for batch_no, version in current.items()
+            if batch_no in Store._assoc_batch_nos(associations)
+        }
+        batches = [
+            {
+                "batch_no": row["batch_no"],
+                "version": int(row["version"]),
+                "origin": row["origin"],
+                "destination": row["destination"],
+                "departed_at": parse_iso(row["departed_at"]),
+                "arrived_at": parse_iso(row["arrived_at"]),
+            }
+            for row in conn.execute(
+                "SELECT batch_no, version, origin, destination, departed_at,"
+                " arrived_at FROM batches WHERE intake_id=? AND superseded=0"
+                " ORDER BY batch_no",
+                (intake_id,),
+            ).fetchall()
+            if row["batch_no"] in pinned
+        ]
+        return {
+            "intake_id": intake_id,
+            "associations": associations,
+            "pinned": pinned,
+            "batches": batches,
+        }
+
+    def publish_inventory(
+        self,
+        query_id: int,
+        outcome: dict[str, Any],
+        *,
+        pinned: dict[str, int],
+        associations: dict[str, list[str]],
+    ) -> None:
+        """Publish result rows and the complete flag in one transaction.
+
+        Refuses to publish when a pinned batch version or a pinned association
+        set has changed since acceptance. Either the answer is based exactly on
+        what was pinned, or nothing is published.
+        """
+        now = iso(utcnow())
+        with self.transaction() as conn:
+            query = conn.execute(
+                "SELECT status, intake_id, assoc_json FROM inventory_queries"
+                " WHERE id=?",
+                (query_id,),
+            ).fetchone()
+            if query is None:
+                raise NotFoundError("inventory query not found")
+            if query["status"] != "pending":
+                raise ConflictError(
+                    f"inventory query {query_id} is {query['status']}, not pending"
+                )
+            intake_id = int(query["intake_id"])
+
+            live = {
+                row["batch_no"]: int(row["version"])
+                for row in conn.execute(
+                    "SELECT batch_no, version FROM batches"
+                    " WHERE intake_id=? AND superseded=0",
+                    (intake_id,),
+                ).fetchall()
+            }
+            changed = sorted(
+                batch_no
+                for batch_no, version in pinned.items()
+                if live.get(batch_no) != version
+            )
+            if changed:
+                raise ConflictError(
+                    "snapshot went stale during computation:"
+                    f" {', '.join(changed)}"
+                )
+
+            relationships = {
+                (row["sample_id"], row["batch_no"])
+                for row in conn.execute(
+                    "SELECT sample_id, batch_no FROM sample_batches"
+                    " WHERE intake_id=?",
+                    (intake_id,),
+                ).fetchall()
+            }
+            pinned_relationships = {
+                (sample_id, batch_no)
+                for sample_id, batch_nos in associations.items()
+                for batch_no in batch_nos
+            }
+            # Any genuinely new association changes the roster population, so
+            # the pinned basis no longer matches; a sample that existed before
+            # but now rides another batch is covered the same way.
+            added = sorted(set(relationships) - pinned_relationships)
+            if added:
+                raise ConflictError(
+                    "sample associations changed during computation:"
+                    f" {', '.join(f'{s}->{b}' for s, b in added)}"
+                )
+
+            for rank, item in enumerate(outcome["in_stock_samples"]):
+                conn.execute(
+                    "INSERT INTO inventory_results(query_id, kind, rank,"
+                    " sample_id, in_stock_since, in_stock_until, support_json)"
+                    " VALUES (?, 'in_stock', ?, ?, ?, ?, ?)",
+                    (
+                        query_id,
+                        rank,
+                        item["sample_id"],
+                        iso(item["in_stock_since"]),
+                        iso(item["in_stock_until"])
+                        if item["in_stock_until"] is not None
+                        else None,
+                        json.dumps(
+                            [
+                                {
+                                    **leg,
+                                    "departed_at": iso(leg["departed_at"]),
+                                    "arrived_at": iso(leg["arrived_at"]),
+                                }
+                                for leg in item["supporting_batches"]
+                            ]
+                        ),
+                    ),
+                )
+            for rank, item in enumerate(outcome["conflicting_samples"]):
+                conn.execute(
+                    "INSERT INTO inventory_results(query_id, kind, rank,"
+                    " sample_id, conflicts_json)"
+                    " VALUES (?, 'conflict', ?, ?, ?)",
+                    (
+                        query_id,
+                        rank,
+                        item["sample_id"],
+                        json.dumps(
+                            [
+                                {
+                                    **conflict,
+                                    "batches": [
+                                        {
+                                            **leg,
+                                            "departed_at": iso(leg["departed_at"]),
+                                            "arrived_at": iso(leg["arrived_at"]),
+                                        }
+                                        for leg in conflict["batches"]
+                                    ],
+                                }
+                                for conflict in item["conflicts"]
+                            ]
+                        ),
+                    ),
+                )
+            conn.execute(
+                "UPDATE inventory_queries SET status='complete',"
+                " completed_at=?, error=NULL WHERE id=?",
+                (now, query_id),
+            )
+
+    def fail_inventory(self, query_id: int, error: str) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "DELETE FROM inventory_results WHERE query_id=?", (query_id,)
+            )
+            conn.execute(
+                "UPDATE inventory_queries SET status='failed', completed_at=?,"
+                " error=? WHERE id=? AND status='pending'",
+                (iso(utcnow()), error, query_id),
+            )
+
+    def read_inventory(self, query_id: int) -> dict[str, Any] | None:
+        """Read a query, its rows and its invalidations in one transaction."""
+        with self.connection() as conn:
+            conn.execute("BEGIN")
+            try:
+                query = conn.execute(
+                    "SELECT * FROM inventory_queries WHERE id=?", (query_id,)
+                ).fetchone()
+                if query is None:
+                    return None
+                results = conn.execute(
+                    "SELECT * FROM inventory_results WHERE query_id=?"
+                    " ORDER BY kind, rank",
+                    (query_id,),
+                ).fetchall()
+                invalidations = conn.execute(
+                    "SELECT * FROM inventory_invalidations WHERE query_id=?"
+                    " ORDER BY seq",
+                    (query_id,),
+                ).fetchall()
+                pinned = json.loads(query["pinned_json"])
+                batches = [
+                    {
+                        "batch_no": row["batch_no"],
+                        "version": int(row["version"]),
+                        "origin": row["origin"],
+                        "destination": row["destination"],
+                        "departed_at": parse_iso(row["departed_at"]),
+                        "arrived_at": parse_iso(row["arrived_at"]),
+                    }
+                    for row in conn.execute(
+                        "SELECT batch_no, version, origin, destination,"
+                        " departed_at, arrived_at FROM batches"
+                        " WHERE intake_id=? AND superseded=0 ORDER BY batch_no",
+                        (int(query["intake_id"]),),
+                    ).fetchall()
+                    if pinned.get(row["batch_no"]) == int(row["version"])
+                ]
+                return {
+                    "query": query,
+                    "results": results,
+                    "invalidations": invalidations,
+                    "pinned": pinned,
+                    "associations": json.loads(query["assoc_json"]),
+                    "batches": batches,
+                }
+            finally:
+                conn.execute("COMMIT")
+
+    def inventory(self, query_id: int) -> sqlite3.Row | None:
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT * FROM inventory_queries WHERE id=?", (query_id,)
+            ).fetchone()
+
+    def inventory_invalidations(self, query_id: int) -> list[sqlite3.Row]:
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT * FROM inventory_invalidations WHERE query_id=?"
+                " ORDER BY seq",
+                (query_id,),
+            ).fetchall()
+
+    def inventory_history(self) -> list[sqlite3.Row]:
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT q.*,"
+                " (SELECT COUNT(*) FROM inventory_results r WHERE r.query_id=q.id"
+                "   AND r.kind='in_stock') AS in_stock_count,"
+                " (SELECT COUNT(*) FROM inventory_results r WHERE r.query_id=q.id"
+                "   AND r.kind='conflict') AS conflict_count,"
+                " (SELECT COUNT(*) FROM inventory_invalidations i"
+                "   WHERE i.query_id=q.id) AS invalidation_count"
+                " FROM inventory_queries q ORDER BY q.id DESC"
             ).fetchall()
 
     # ----------------------------------------------------------------- audit

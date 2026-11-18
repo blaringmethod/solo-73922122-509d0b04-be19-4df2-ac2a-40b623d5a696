@@ -49,6 +49,14 @@ echo "$TRACE" | pretty
 TRACE_ID=$(echo "$TRACE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["trace_id"])')
 
 echo
+echo "== as-of inventory: who is stored at Hub-North at 2026-01-01T23:00:00Z =="
+CHECK=$(curl -fsS -X POST "$API/inventory-checks" \
+  -H 'Content-Type: application/json' \
+  -d '{"site": "Hub-North", "as_of": "2026-01-01T23:00:00Z"}')
+echo "$CHECK" | pretty
+CHECK_ID=$(echo "$CHECK" | python3 -c 'import json,sys; print(json.load(sys.stdin)["query_id"])')
+
+echo
 echo "== correct B${RUN}-1002 (client saw version 1): Reference-Lab -> Cold-Room =="
 curl -fsS -X POST "$API/batches/B${RUN}-1002/corrections" \
   -H 'Content-Type: application/json' \
@@ -64,6 +72,18 @@ echo
 echo "== the old snapshot is now invalid =="
 curl -sS -o "$WORK/old.json" -w 'HTTP %{http_code}\n' "$API/traces/$TRACE_ID"
 pretty <"$WORK/old.json" || cat "$WORK/old.json"
+
+echo
+echo "== the old inventory conclusion is invalid too =="
+curl -sS -o "$WORK/old-check.json" -w 'HTTP %{http_code}\n' \
+  "$API/inventory-checks/$CHECK_ID"
+pretty <"$WORK/old-check.json" || cat "$WORK/old-check.json"
+
+echo
+echo "== a fresh inventory check reflects the corrected batch =="
+curl -fsS -X POST "$API/inventory-checks" \
+  -H 'Content-Type: application/json' \
+  -d '{"site": "Hub-North", "as_of": "2026-01-01T23:00:00Z"}' | pretty
 
 echo
 echo "== a fresh trace reflects the corrected batch =="

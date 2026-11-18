@@ -18,6 +18,8 @@ def test_openapi_and_docs_available(client):
     assert "/intakes" in paths
     assert "/traces" in paths
     assert "/batches/{batch_no}/corrections" in paths
+    assert "/inventory-checks" in paths
+    assert "/inventory-checks/{query_id}" in paths
     docs = client.get("/docs")
     assert docs.status_code == 200
     assert "text/html" in docs.headers["content-type"]
